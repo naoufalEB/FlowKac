@@ -58,7 +58,9 @@ def get_arguments():
     parser.add_argument("--importance_sampling", type=eval, default=False, choices=[True, False])
 
     parser.add_argument("--seed", type=int, default=None, help="seed to ensure deterministic behavior")
-
+    
+    parser.add_argument("--adapt_x0", type=eval, default = False, help = "adapt x0 to each batch")
+    
     args, unknown = parser.parse_known_args()
     
     # Convert the string to a list of integers

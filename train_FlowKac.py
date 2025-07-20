@@ -104,18 +104,27 @@ if __name__ == '__main__':
             
             if args.sto_taylor_order == "inf":
                 sampling_in_loop = True
+            elif args.adapt_x0:
+                sampling_in_loop = False
             else:
                 sampling_in_loop = False
                 sde_samples, sde_jacobian, sde_hessian = sdeSampler.sample()            
             
+            
+            net_tnf.train()
+            
             for temp_i, input_data in enumerate(train_loader):
-                                
-                input_data.requires_grad_()
                 
+                input_data.requires_grad_()
                 
                 if sampling_in_loop:
                     sde_samples, sde_jacobian, sde_hessian = sdeSampler.sample(input_data)
+                elif args.adapt_x0:
+                    centroid = input_data.mean(dim = 0, keepdim = True)
+                    sde_samples, sde_jacobian, sde_hessian = sdeSampler.sample(centroid)
+                    
                 
+                    
                 XX = input_data.view(args.batch_size, 1, args.Dx).expand(args.batch_size, args.T_num, args.Dx)
                 TT = t_input.view(1, args.T_num).expand(args.batch_size, args.T_num)
                 
@@ -153,6 +162,8 @@ if __name__ == '__main__':
             logger.info(log_message)
             
             if (i+1) % args.test_freq == 0:
+                
+                net_tnf.eval()
                 
                 with torch.no_grad():
                     

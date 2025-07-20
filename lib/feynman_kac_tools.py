@@ -32,11 +32,36 @@ class BaseSampler:
         self.Dx = args.Dx
         self.W_Dx = args.W_Dx
         self.N_sample = args.N_sample
-        self.t_vec_subdivised, self.init_index = t_sde_sample(t_vec, args)
         self.eps = 1e-5
-        
         self.device = torch.device(args.device)
         self.method = "euler"
+        
+        self.t_vec_subdivised, self.init_index = self._subdivide_time(t_vec)
+        
+        
+    def _subdivide_time(self, t_vec):
+        new_len = self.args.multiplier_T_num * (self.args.T_num - 1) + 1
+        new_t = torch.linspace(0, self.args.T_max, new_len, device=self.device)
+        index = torch.arange(0, new_len, self.args.multiplier_T_num, device=self.device)
+        return new_t, index
+    
+    def _expand_x0(self, x0):
+        if x0 is None:
+            return torch.zeros(self.N_sample, self.Dx, device=self.device)
+        return x0.view(x0.shape[0], 1, self.Dx).expand(-1, self.N_sample, -1).reshape(-1, self.Dx)
+    
+    def _make_bm(self):
+        return torchsde.BrownianInterval(
+            t0=self.t_vec_subdivised[0],
+            t1=self.t_vec_subdivised[-1],
+            size=(self.N_sample, self.W_Dx),
+            device=self.device
+        )
+    
+    def _reshape_output(self, xhat):
+        xhat = xhat[self.init_index]
+        xhat = xhat.view(len(self.t_vec), -1, self.N_sample, self.Dx)
+        return torch.transpose(xhat, 1, 0)
     
     def sample(self):
         raise NotImplementedError("Subclasses should implement this method")
@@ -46,8 +71,9 @@ class ExactSampler(BaseSampler):
     
     @torch.no_grad()
     def sample(self, x0):
-          
-        x0 = x0.view(x0.shape[0], 1, self.Dx).expand(-1, self.N_sample, -1).reshape(-1, self.Dx)
+         
+        x0 = self._expand_x0(x0)
+        #x0 = x0.view(x0.shape[0], 1, self.Dx).expand(-1, self.N_sample, -1).reshape(-1, self.Dx)
         xhat = torchsde.sdeint(self.sde, x0, self.t_vec_subdivised, method=self.method)
         
         xhat = xhat[self.init_index, ...]
@@ -61,24 +87,28 @@ class JacobianSampler(BaseSampler):
     """
     Jacobian approximation using finite differences
     """
-    def sample(self):
-        with torch.no_grad():
-            
-            bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.t_vec.device)
-            x0 = torch.zeros(self.N_sample, self.Dx, device = self.device)#.to(self.t_vec)
-            xhat = torchsde.sdeint(self.sde, x0, self.t_vec_subdivised, method=self.method, bm = bm)
-            jacobian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx), device = self.device)#.to(self.t_vec)
+    @torch.no_grad()
+    def sample(self, x0 = None):
+    
+        x0 = self._expand_x0(x0)
+        bm = self._make_bm()
+        
+        #bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.t_vec.device)
+        #x0 = torch.zeros(self.N_sample, self.Dx, device = self.device)#.to(self.t_vec)
+        xhat = torchsde.sdeint(self.sde, x0, self.t_vec_subdivised, method=self.method, bm = bm)
+        jacobian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx), device = self.device)#.to(self.t_vec)
 
-            for i in range(self.Dx):
-                torch_eps = torch.zeros_like(x0)
-                torch_eps[:, i] = self.eps
-                xhat_eps = torchsde.sdeint(self.sde, x0 + torch_eps, self.t_vec_subdivised, method=self.method, bm = bm)
-                jacobian_xhat[..., i] = (xhat_eps - xhat) / self.eps
+        for i in range(self.Dx):
+            torch_eps = torch.zeros_like(x0)
+            torch_eps[:, i] = self.eps
+            xhat_eps = torchsde.sdeint(self.sde, x0 + torch_eps, self.t_vec_subdivised, method=self.method, bm = bm)
+            jacobian_xhat[..., i] = (xhat_eps - xhat) / self.eps
 
-            jacobian_xhat = jacobian_xhat[self.init_index, ...]
-            xhat = xhat[self.init_index, ...]
-            xhat = xhat.view(len(self.t_vec), -1, self.N_sample, self.Dx)
-            xhat = torch.transpose(xhat, 1, 0)
+        jacobian_xhat = jacobian_xhat[self.init_index, ...]
+        
+        xhat = xhat[self.init_index, ...]
+        xhat = xhat.view(len(self.t_vec), -1, self.N_sample, self.Dx)
+        xhat = torch.transpose(xhat, 1, 0)
 
         return xhat, jacobian_xhat, None
 
@@ -87,9 +117,12 @@ class JacobianSamplerExact(BaseSampler):
     Jacobian computation using autodiff
     """
     @torch.no_grad()
-    def sample(self):
-        bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.device)
-        x0 = torch.zeros(self.Dx, device = self.device)
+    def sample(self, x0 = None):
+        
+        x0 = self._expand_x0(x0)
+        bm = self._make_bm()
+        #bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.device)
+        #x0 = torch.zeros(self.Dx, device = self.device)
         
         def compute_x_paths(x0):
             x0_bis = x0.expand(self.N_sample, self.Dx)
@@ -111,9 +144,13 @@ class HessianSamplerExact(BaseSampler):
     Hessian computation using autodiff
     """
     @torch.no_grad()
-    def sample(self):
-        bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.device)
-        x0 = torch.zeros(self.Dx, device = self.device)
+    def sample(self, x0 = None):
+        
+        x0 = self._expand_x0(x0)
+        bm = self._make_bm()
+        
+        #bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.device)
+        #x0 = torch.zeros(self.Dx, device = self.device)
         
         def compute_x_paths(x0):
             x0_bis = x0.expand(self.N_sample, self.Dx)
@@ -139,44 +176,47 @@ class HessianSampler(BaseSampler):
     """
     Hessian approximation using finite differences
     """
-    def sample(self):
+    @torch.no_grad()
+    def sample(self, x0 = None):
         
-        with torch.no_grad():
-            bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.t_vec.device)
-            x0 = torch.zeros(self.N_sample, self.Dx).to(self.t_vec)
-            xhat = torchsde.sdeint(self.sde, x0, self.t_vec_subdivised, method=self.method, bm = bm)
-            jacobian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx)).to(self.t_vec)
-            hessian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx, self.Dx)).to(self.t_vec)
+        x0 = self._expand_x0(x0)
+        bm = self._make_bm()
+        
+        #bm = torchsde.BrownianInterval(t0=self.t_vec_subdivised[0], t1=self.t_vec_subdivised[-1], size=(self.N_sample, self.W_Dx), device = self.t_vec.device)
+        #x0 = torch.zeros(self.N_sample, self.Dx).to(self.t_vec)
+        xhat = torchsde.sdeint(self.sde, x0, self.t_vec_subdivised, method=self.method, bm = bm)
+        jacobian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx)).to(self.t_vec)
+        hessian_xhat = torch.zeros((len(self.t_vec_subdivised), self.N_sample, self.Dx, self.Dx, self.Dx)).to(self.t_vec)
 
-            for i in range(self.Dx):
-                torch_eps = torch.zeros_like(x0)
-                torch_eps[:, i] = self.eps
-    
-                xhat_eps = torchsde.sdeint(self.sde, x0 + torch_eps, self.t_vec_subdivised, method=self.method, bm=bm)
-                xhat_neg_eps = torchsde.sdeint(self.sde, x0 - torch_eps, self.t_vec_subdivised, method=self.method, bm=bm)
-                
-                jacobian_xhat[..., i] = (xhat_eps - xhat_neg_eps) / (2*self.eps)
-                
-                # partial^2 f / partial x_i ^2
-                hessian_xhat[:,:, i, i, :] = torch.clamp((xhat_eps - 2 * xhat + xhat_neg_eps) / (self.eps ** 2), min=-1e10, max=1e10) # derivee seconde
-                
-            # partial^2 f / partial x_i partial x_j
-            torch_full_eps = self.eps * torch.ones_like(x0)
-            torch_eps_neg_eps = torch.clone(torch_full_eps)
-            torch_eps_neg_eps[:,1] = -self.eps
+        for i in range(self.Dx):
+            torch_eps = torch.zeros_like(x0)
+            torch_eps[:, i] = self.eps
+
+            xhat_eps = torchsde.sdeint(self.sde, x0 + torch_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+            xhat_neg_eps = torchsde.sdeint(self.sde, x0 - torch_eps, self.t_vec_subdivised, method=self.method, bm=bm)
             
-            torch_neg_eps_eps = torch.clone(torch_full_eps)
-            torch_eps_neg_eps[:,0] = -self.eps
+            jacobian_xhat[..., i] = (xhat_eps - xhat_neg_eps) / (2*self.eps)
             
-            xhat_eps = torchsde.sdeint(self.sde, x0 + torch_full_eps, self.t_vec_subdivised, method=self.method, bm=bm)
-            xhat_neg_eps = torchsde.sdeint(self.sde, x0 - torch_full_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+            # partial^2 f / partial x_i ^2
+            hessian_xhat[:,:, i, i, :] = torch.clamp((xhat_eps - 2 * xhat + xhat_neg_eps) / (self.eps ** 2), min=-1e10, max=1e10) # derivee seconde
             
-            xhat_eps_neg_eps = torchsde.sdeint(self.sde, x0 + torch_eps_neg_eps, self.t_vec_subdivised, method=self.method, bm=bm)
-            xhat_neg_eps_eps = torchsde.sdeint(self.sde, x0 + torch_neg_eps_eps, self.t_vec_subdivised, method=self.method, bm=bm)
-            
-            partial_Xhat_x1_x2 = (xhat_eps - xhat_eps_neg_eps - xhat_neg_eps_eps + xhat_neg_eps)/(4 * (self.eps**2) )
-            hessian_xhat[:, :, 0, 1, :] = torch.clamp(partial_Xhat_x1_x2, min = -1e10, max = 1e10)
-            hessian_xhat[:, :, 1, 0, :] = torch.clamp(partial_Xhat_x1_x2, min = -1e10, max = 1e10)
+        # partial^2 f / partial x_i partial x_j
+        torch_full_eps = self.eps * torch.ones_like(x0)
+        torch_eps_neg_eps = torch.clone(torch_full_eps)
+        torch_eps_neg_eps[:,1] = -self.eps
+        
+        torch_neg_eps_eps = torch.clone(torch_full_eps)
+        torch_eps_neg_eps[:,0] = -self.eps
+        
+        xhat_eps = torchsde.sdeint(self.sde, x0 + torch_full_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+        xhat_neg_eps = torchsde.sdeint(self.sde, x0 - torch_full_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+        
+        xhat_eps_neg_eps = torchsde.sdeint(self.sde, x0 + torch_eps_neg_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+        xhat_neg_eps_eps = torchsde.sdeint(self.sde, x0 + torch_neg_eps_eps, self.t_vec_subdivised, method=self.method, bm=bm)
+        
+        partial_Xhat_x1_x2 = (xhat_eps - xhat_eps_neg_eps - xhat_neg_eps_eps + xhat_neg_eps)/(4 * (self.eps**2) )
+        hessian_xhat[:, :, 0, 1, :] = torch.clamp(partial_Xhat_x1_x2, min = -1e10, max = 1e10)
+        hessian_xhat[:, :, 1, 0, :] = torch.clamp(partial_Xhat_x1_x2, min = -1e10, max = 1e10)
 
         return xhat, jacobian_xhat, hessian_xhat
     
@@ -199,10 +239,10 @@ class SdeSampler:
         
 
     def sample(self, x0=None):
-        if x0 is not None:
-            return self.sampler.sample(x0)
-        return self.sampler.sample()
-
+        #if x0 is not None:
+        #    return self.sampler.sample(x0)
+        #return self.sampler.sample()
+        return self.sampler.sample(x0) 
 
 
     
